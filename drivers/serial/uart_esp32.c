@@ -7,6 +7,8 @@
 
 #define DT_DRV_COMPAT espressif_esp32_uart
 
+#include <zephyr/kernel.h>
+
 /* Include esp-idf headers first to avoid redefining BIT() macro */
 /* TODO: include w/o prefix */
 #ifdef CONFIG_SOC_SERIES_ESP32
@@ -111,7 +113,7 @@ struct uart_esp32_data {
 
 #define UART_FIFO_LIMIT	    (UART_LL_FIFO_DEF_LEN)
 #define UART_TX_FIFO_THRESH 0x1
-#define UART_RX_FIFO_THRESH 0x16
+#define UART_RX_FIFO_THRESH 0x1
 
 #if CONFIG_UART_INTERRUPT_DRIVEN || CONFIG_UART_ASYNC_API
 static void uart_esp32_isr(void *arg);
@@ -153,6 +155,104 @@ static int uart_esp32_err_check(const struct device *dev)
 
 	return err;
 }
+
+#if CONFIG_UART_WIDE_DATA
+
+static uint8_t uart_data_parity(uint8_t data)
+{
+	data ^= (data >> 1);
+	data ^= (data >> 2);
+	data ^= (data >> 4);
+	return data & 0x01;
+}
+
+static void uart_esp32_poll_out_u16(const struct device *dev, uint16_t c)
+{
+	struct uart_esp32_data *data = dev->data;
+	uint32_t written;
+
+	/* Wait for space in FIFO */
+	while (uart_hal_get_txfifo_len(&data->hal) == 0) {
+		; /* Wait */
+	}
+
+
+	while (uart_hal_is_tx_idle(&data->hal) == 0) {
+		; /* Wait */
+	}
+
+	uart_hal_txfifo_rst(&data->hal);
+
+	/* Compute the parity of the first 8 bits */
+	uint8_t oddNeven = uart_data_parity(c & 0xFF);
+
+	uart_parity_t applied_parity = 0;
+
+	uart_hal_get_parity(&data->hal, &applied_parity);
+
+
+	uart_parity_t parity;
+
+	/* When the parity matches the bit8 state, use the parity of the 8 bits word */
+	if ((c & 0x100) != 0) {
+		/* bit 9 should be 1, if 8 bits are odd we set parity to even */
+		/* to have bit9 set to 1 */
+		parity = oddNeven ? UART_PARITY_EVEN : UART_PARITY_ODD;
+	} else {
+		parity = oddNeven ? UART_PARITY_ODD : UART_PARITY_EVEN;
+	}
+
+	if (applied_parity != parity) {
+		uart_hal_set_parity(&data->hal, parity);
+	}
+
+	/* Send a character */
+	uint8_t value = c;
+
+	uart_hal_write_txfifo(&data->hal, &value, 1, &written);
+}
+
+
+static int uart_esp32_poll_in_u16(const struct device *dev, uint16_t *p_char)
+{
+	struct uart_esp32_data *data = dev->data;
+	int inout_rd_len = 1;
+
+	if (uart_hal_get_rxfifo_len(&data->hal) == 0) {
+		return -1;
+	}
+
+	uart_parity_t parity;
+
+	uart_hal_get_parity(&data->hal, &parity);
+	int err = uart_esp32_err_check(dev);
+
+	uint8_t c = 0;
+
+	uart_hal_read_rxfifo(&data->hal, &c, &inout_rd_len);
+
+	uint8_t oddNeven = uart_data_parity(c);
+
+	printk("err: %d data: %d oddNeven: %d\n", err, c, oddNeven);
+
+	*p_char = c;
+
+	/* bit8 should be 1 when parity of 8 bits doesn't match the configured parity */
+	if ((oddNeven && parity == UART_PARITY_EVEN)
+		||
+		 (!oddNeven && parity == UART_PARITY_ODD)) {
+		*p_char |= 0x100;
+	}
+
+	/* When a parity error is detected, invert the bit8 since it wasn't matching */
+	/* what it should be */
+	if (err & UART_INTR_PARITY_ERR) {
+		*p_char ^= 0x100; /* invert bit 9 if parity error */
+	}
+
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_UART_USE_RUNTIME_CONFIGURE
 static int uart_esp32_config_get(const struct device *dev, struct uart_config *cfg)
@@ -300,10 +400,16 @@ static int uart_esp32_configure(const struct device *dev, const struct uart_conf
 	case UART_CFG_DATA_BITS_7:
 		uart_hal_set_data_bit_num(&data->hal, UART_DATA_7_BITS);
 		break;
+	case UART_CFG_DATA_BITS_9:
+		uart_hal_set_parity(&data->hal, UART_PARITY_EVEN);
 	case UART_CFG_DATA_BITS_8:
 		uart_hal_set_data_bit_num(&data->hal, UART_DATA_8_BITS);
 		break;
 	default:
+		return -ENOTSUP;
+	}
+
+	if (cfg->data_bits == UART_CFG_DATA_BITS_9 && cfg->parity != UART_CFG_PARITY_NONE) {
 		return -ENOTSUP;
 	}
 
@@ -956,6 +1062,10 @@ static const DRAM_ATTR struct uart_driver_api uart_esp32_api = {
 	.poll_in = uart_esp32_poll_in,
 	.poll_out = uart_esp32_poll_out,
 	.err_check = uart_esp32_err_check,
+#ifdef CONFIG_UART_WIDE_DATA
+	.poll_in_u16 = uart_esp32_poll_in_u16,
+	.poll_out_u16 = uart_esp32_poll_out_u16,
+#endif
 #ifdef CONFIG_UART_USE_RUNTIME_CONFIGURE
 	.configure = uart_esp32_configure,
 	.config_get = uart_esp32_config_get,
