@@ -24,37 +24,38 @@ static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
 static char rx_buf[MSG_SIZE];
 static int rx_buf_pos;
 
+static uint16_t tx_buf[MSG_SIZE];
+static uint8_t tx_len;
+
 /*
  * Read characters from UART until line end is detected. Afterwards push the
  * data to the message queue.
  */
 void serial_cb(const struct device *dev, void *user_data)
 {
-	uint8_t c;
+	uint16_t c;
+
+	printk("In IRQ\n");
 
 	if (!uart_irq_update(uart_dev)) {
 		return;
 	}
 
-	if (!uart_irq_rx_ready(uart_dev)) {
+	if (uart_irq_rx_ready(uart_dev)) {
+		uart_fifo_read_u16(uart_dev, &c, 1);
+		rx_buf[rx_buf_pos++] = c;
 		return;
 	}
 
-	/* read until FIFO empty */
-	while (uart_fifo_read(uart_dev, &c, 1) == 1) {
-		if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
-			/* terminate string */
-			rx_buf[rx_buf_pos] = '\0';
-
-			/* if queue is full, message is silently dropped */
-			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
-
-			/* reset the buffer (it was copied to the msgq) */
-			rx_buf_pos = 0;
-		} else if (rx_buf_pos < (sizeof(rx_buf) - 1)) {
-			rx_buf[rx_buf_pos++] = c;
+	if (uart_irq_tx_ready(uart_dev)) {
+		/* send next char */
+		if (tx_len > 0) {
+			tx_len--;
+			uart_fifo_fill_u16(uart_dev, &tx_buf[tx_len], 1);
+		} else {
+			uart_irq_tx_disable(uart_dev);
 		}
-		/* else: characters beyond buffer size are dropped */
+		return;
 	}
 }
 
@@ -70,6 +71,7 @@ void print_uart(char *buf)
 	}
 }
 
+/*#define UART_9BIT_RECEIVE*/
 
 void main(void)
 {
@@ -91,21 +93,60 @@ void main(void)
 		return;
 	}
 
+	int ret = uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+
+	if (ret < 0) {
+		if (ret == -ENOTSUP) {
+			printk("Interrupt-driven UART API support not enabled\n");
+		} else if (ret == -ENOSYS) {
+			printk("UART device does not support interrupt-driven API\n");
+		} else {
+			printk("Error setting UART callback: %d\n", ret);
+		}
+	}
+	/* uart_irq_rx_enable(uart_dev);*/
+
+
 	uint16_t tx_data = 0x123;
 	uint16_t rx_data;
 
 	while (1) {
-
-		uart_poll_out_u16(uart_dev, tx_data);
 #ifdef UART_9BIT_RECEIVE
+		uart_poll_out_u16(uart_dev, tx_data);
 		if (uart_poll_in_u16(uart_dev, &rx_data) != 0) {
 			printk("Failed to receive data!\n");
-			return;
+		} else {
+			printk("Recv 1 %d: %x -> %x\n", tx_data == rx_data, tx_data, rx_data);
 		}
 #endif
+		/*uart_poll_out_u16(uart_dev, tx_data);*/
 		tx_data ^= 0x100;
 
-		uart_poll_out_u16(uart_dev, 0x145);
-		uart_poll_out_u16(uart_dev, 0x012);
+
+		tx_len = 0;
+		for (uint16_t i = 0; i < 8; i++) {
+			tx_data = (tx_data & 0xff00) + i;
+			tx_buf[tx_len++] = tx_data;
+		}
+
+		for (uint16_t i = 0; i < tx_len; i++) {
+			printk("TX: %d %x\n", i, tx_buf[i]);
+		}
+		/* uart_irq_rx_enable(uart_dev);*/
+		/* uart_irq_tx_enable(uart_dev);*/
+
+		while (tx_len > 0) {
+			k_sleep(K_MSEC(1));
+		}
+
+
+		k_sleep(K_MSEC(1));
+
+		for (uint16_t i = 0; i < rx_buf_pos; i++) {
+			printk("RX: %d %x\n", i, rx_buf[i]);
+		}
+
+		rx_buf_pos = 0;
+
 	}
 }

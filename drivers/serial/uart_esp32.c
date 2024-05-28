@@ -222,25 +222,31 @@ static int uart_esp32_poll_in_u16(const struct device *dev, uint16_t *p_char)
 		return -1;
 	}
 
-	uart_parity_t parity;
-
-	uart_hal_get_parity(&data->hal, &parity);
-	int err = uart_esp32_err_check(dev);
-
 	uint8_t c = 0;
+
+	int err = uart_hal_get_intraw_mask(&data->hal) & UART_INTR_PARITY_ERR;
+
+	uart_hal_clr_intsts_mask(&data->hal, UART_INTR_PARITY_ERR);
 
 	uart_hal_read_rxfifo(&data->hal, &c, &inout_rd_len);
 
 	uint8_t oddNeven = uart_data_parity(c);
 
-	printk("err: %d data: %d oddNeven: %d\n", err, c, oddNeven);
+	uart_parity_t parity;
+
+	uart_hal_get_parity(&data->hal, &parity);
+
+	if (err)
+		printk("err:%d\n", err);
+
+	/*printk("data: %d oddNeven: %d parity: %d\n", err, c, oddNeven, parity);*/
 
 	*p_char = c;
 
 	/* bit8 should be 1 when parity of 8 bits doesn't match the configured parity */
 	if ((oddNeven && parity == UART_PARITY_EVEN)
 		||
-		 (!oddNeven && parity == UART_PARITY_ODD)) {
+		(!oddNeven && parity == UART_PARITY_ODD)) {
 		*p_char |= 0x100;
 	}
 
@@ -402,6 +408,8 @@ static int uart_esp32_configure(const struct device *dev, const struct uart_conf
 		break;
 	case UART_CFG_DATA_BITS_9:
 		uart_hal_set_parity(&data->hal, UART_PARITY_EVEN);
+		uart_ll_discard_error_data(data->hal.dev, false);
+		/*uart_hal_ena_intr_mask(&data->hal, UART_INTR_PARITY_ERR);*/
 	case UART_CFG_DATA_BITS_8:
 		uart_hal_set_data_bit_num(&data->hal, UART_DATA_8_BITS);
 		break;
@@ -475,19 +483,104 @@ static int uart_esp32_fifo_read(const struct device *dev, uint8_t *rx_data, cons
 	return read;
 }
 
+#ifdef CONFIG_UART_WIDE_DATA
+static int uart_esp32_fifo_fill_u16(const struct device *dev, const uint16_t *tx_data, int len)
+{
+	struct uart_esp32_data *data = dev->data;
+	uint32_t written = 0;
+
+	if (len < 0) {
+		return 0;
+	}
+
+	uint8_t c = *tx_data;
+
+	/* Compute the parity of the first 8 bits */
+	uint8_t oddNeven = uart_data_parity(c & 0xFF);
+
+	uart_parity_t applied_parity = 0;
+
+	uart_hal_get_parity(&data->hal, &applied_parity);
+
+	uart_parity_t parity;
+
+	/* When the parity matches the bit8 state, use the parity of the 8 bits word */
+	if ((c & 0x100) != 0) {
+		/* bit 9 should be 1, if 8 bits are odd we set parity to even */
+		/* to have bit9 set to 1 */
+		parity = oddNeven ? UART_PARITY_EVEN : UART_PARITY_ODD;
+	} else {
+		parity = oddNeven ? UART_PARITY_ODD : UART_PARITY_EVEN;
+	}
+
+	if (applied_parity != parity) {
+		uart_hal_set_parity(&data->hal, parity);
+	}
+
+	/* Send a character */
+	uint8_t value = c;
+
+	uart_hal_write_txfifo(&data->hal, &value, 1, &written);
+
+	return written;
+}
+
+static int uart_esp32_fifo_read_u16(const struct device *dev, uint16_t *rx_data, const int len)
+{
+	struct uart_esp32_data *data = dev->data;
+	int inout_rd_len = 1;
+
+	uint8_t c = 0;
+
+	int err = uart_hal_get_intraw_mask(&data->hal) & UART_INTR_PARITY_ERR;
+
+	uart_hal_clr_intsts_mask(&data->hal, UART_INTR_PARITY_ERR);
+
+	uart_hal_read_rxfifo(&data->hal, &c, &inout_rd_len);
+
+	uint8_t oddNeven = uart_data_parity(c);
+
+	uart_parity_t parity;
+
+	uart_hal_get_parity(&data->hal, &parity);
+
+	if (err)
+		printk("err:%d\n", err);
+
+	/*printk("data: %d oddNeven: %d parity: %d\n", err, c, oddNeven, parity);*/
+
+	*rx_data = c;
+
+	/* bit8 should be 1 when parity of 8 bits doesn't match the configured parity */
+	if ((oddNeven && parity == UART_PARITY_EVEN)
+		||
+		(!oddNeven && parity == UART_PARITY_ODD)) {
+		*rx_data |= 0x100;
+	}
+
+	/* When a parity error is detected, invert the bit8 since it wasn't matching */
+	/* what it should be */
+	if (err & UART_INTR_PARITY_ERR) {
+		*rx_data ^= 0x100; /* invert bit 9 if parity error */
+	}
+
+	return inout_rd_len;
+}
+#endif
+
 static void uart_esp32_irq_tx_enable(const struct device *dev)
 {
 	struct uart_esp32_data *data = dev->data;
 
-	uart_hal_clr_intsts_mask(&data->hal, UART_INTR_TXFIFO_EMPTY);
-	uart_hal_ena_intr_mask(&data->hal, UART_INTR_TXFIFO_EMPTY);
+	uart_hal_clr_intsts_mask(&data->hal, UART_INTR_TX_DONE);
+	uart_hal_ena_intr_mask(&data->hal, UART_INTR_TX_DONE);
 }
 
 static void uart_esp32_irq_tx_disable(const struct device *dev)
 {
 	struct uart_esp32_data *data = dev->data;
 
-	uart_hal_disable_intr_mask(&data->hal, UART_INTR_TXFIFO_EMPTY);
+	uart_hal_disable_intr_mask(&data->hal, UART_INTR_TX_DONE);
 }
 
 static int uart_esp32_irq_tx_ready(const struct device *dev)
@@ -495,7 +588,7 @@ static int uart_esp32_irq_tx_ready(const struct device *dev)
 	struct uart_esp32_data *data = dev->data;
 
 	return (uart_hal_get_txfifo_len(&data->hal) > 0 &&
-		uart_hal_get_intr_ena_status(&data->hal) & UART_INTR_TXFIFO_EMPTY);
+		uart_hal_get_intr_ena_status(&data->hal) & UART_INTR_TX_DONE);
 }
 
 static void uart_esp32_irq_rx_disable(const struct device *dev)
@@ -1073,6 +1166,10 @@ static const DRAM_ATTR struct uart_driver_api uart_esp32_api = {
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	.fifo_fill = uart_esp32_fifo_fill,
 	.fifo_read = uart_esp32_fifo_read,
+#ifdef CONFIG_UART_WIDE_DATA
+	.fifo_fill_u16 = uart_esp32_fifo_fill_u16,
+	.fifo_read_u16 = uart_esp32_fifo_read_u16,
+#endif
 	.irq_tx_enable = uart_esp32_irq_tx_enable,
 	.irq_tx_disable = uart_esp32_irq_tx_disable,
 	.irq_tx_ready = uart_esp32_irq_tx_ready,
